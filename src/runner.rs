@@ -143,7 +143,7 @@ impl ModelRunner {
     }
 
     fn load_models(&mut self, loc_id: &str) -> BmiResult<()> {
-        let modules: Vec<ModuleConfig> = self.config.modules().into_iter().cloned().collect();
+        let modules: Vec<ModuleConfig> = self.config.modules_for(loc_id)?;
         let mut pending: Vec<(ModuleConfig, Vec<String>)> = modules
             .into_iter()
             .map(|m| {
@@ -286,9 +286,7 @@ impl ModelRunner {
             model.initialize("/dev/null")?;
         } else {
             model.initialize(&module.params.init_config(loc_id))?;
-            for (name, val) in module.params.params_f64() {
-                let _ = model.set_value(&name, &[val]);
-            }
+            set_model_params(&mut *model, module, loc_id);
         }
 
         Ok(model)
@@ -623,6 +621,49 @@ impl ModelRunner {
     }
     pub fn location(&self) -> &str {
         &self.location_id
+    }
+}
+
+/// Set a module's `model_params` on an initialized model.
+///
+/// Each value list is checked against the variable's element count (nbytes / itemsize): a single
+/// value is broadcast to every element (e.g. one value for all soil layers), and any other length
+/// mismatch is refused, because BMI `set_value` copies a whole variable's worth of elements from
+/// the buffer and a short buffer would be read past its end. Failures are reported on stderr
+/// instead of being dropped, so a misspelled parameter doesn't silently do nothing.
+fn set_model_params(model: &mut dyn Bmi, module: &ModuleConfig, loc_id: &str) {
+    let model_name = &module.params.model_type_name;
+    let (params, skipped) = module.params.param_values();
+    for name in skipped {
+        eprintln!("warning: {loc_id}: {model_name}.{name}: model_params value is not numeric; not set");
+    }
+    for (name, mut vals) in params {
+        let count = match (model.get_var_nbytes(&name), model.get_var_itemsize(&name)) {
+            (Ok(nb), Ok(sz)) if nb > 0 && sz > 0 => Some((nb / sz) as usize),
+            _ => None,
+        };
+        match count {
+            Some(n) if vals.len() == 1 && n > 1 => vals = vec![vals[0]; n],
+            Some(n) if vals.len() != n => {
+                eprintln!(
+                    "warning: {loc_id}: {model_name}.{name}: {} value(s) given, variable has {n}; not set",
+                    vals.len()
+                );
+                continue;
+            }
+            Some(_) => {}
+            None => {
+                if vals.len() > 1 {
+                    eprintln!(
+                        "warning: {loc_id}: {model_name}.{name}: size unknown, list value not set"
+                    );
+                    continue;
+                }
+            }
+        }
+        if let Err(e) = model.set_value(&name, &vals) {
+            eprintln!("warning: {loc_id}: {model_name}.{name}: set_value failed: {e}");
+        }
     }
 }
 

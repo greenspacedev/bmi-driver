@@ -78,6 +78,19 @@ pub struct RealizationConfig {
     pub output_root: String,
     #[serde(default, skip_serializing_if = "is_default_output_format")]
     pub output_format: OutputFormat,
+    /// Per-location overrides, in ngen's realization format:
+    /// `"catchments": { "cat-1": { "formulations": [ { "name": "bmi_multi", "params": { "modules": [...] } } ] } }`.
+    /// Only each module's `model_params` are taken from here (merged over the global module with
+    /// the same `model_type_name`); everything else comes from `global`. See `modules_for`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub catchments: HashMap<String, CatchmentConfig>,
+}
+
+/// One entry of the `catchments` block. Other ngen keys (e.g. `forcing`) are accepted and ignored.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CatchmentConfig {
+    #[serde(default)]
+    pub formulations: Vec<FormulationConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -202,6 +215,30 @@ impl ModuleParams {
             .collect()
     }
 
+    /// Numeric `model_params` as value lists: a number (or numeric string) gives one value, a JSON
+    /// array of numbers gives all of them (for array variables such as per-soil-layer parameters).
+    /// Entries that aren't numeric are returned in the second list so callers can report them.
+    pub fn param_values(&self) -> (Vec<(String, Vec<f64>)>, Vec<String>) {
+        let mut vals = Vec::new();
+        let mut skipped = Vec::new();
+        let mut keys: Vec<&String> = self.model_params.keys().collect();
+        keys.sort();
+        for k in keys {
+            let v = &self.model_params[k];
+            let parsed = match v {
+                serde_json::Value::Number(n) => n.as_f64().map(|f| vec![f]),
+                serde_json::Value::String(s) => s.parse().ok().map(|f| vec![f]),
+                serde_json::Value::Array(a) => a.iter().map(|x| x.as_f64()).collect::<Option<Vec<f64>>>(),
+                _ => None,
+            };
+            match parsed {
+                Some(p) if !p.is_empty() => vals.push((k.clone(), p)),
+                _ => skipped.push(k.clone()),
+            }
+        }
+        (vals, skipped)
+    }
+
     pub fn params_string(&self) -> HashMap<String, String> {
         self.model_params
             .iter()
@@ -260,6 +297,35 @@ impl RealizationConfig {
             .filter(|f| f.name == "bmi_multi")
             .flat_map(|f| f.params.modules.iter())
             .collect()
+    }
+
+    /// The modules to run at one location: the global modules, with each module's `model_params`
+    /// overlaid by that location's entry in `catchments` (matched by `model_type_name`; keys in
+    /// the catchment entry replace global keys, other global keys are kept). Locations without an
+    /// entry get the global modules unchanged.
+    pub fn modules_for(&self, loc_id: &str) -> BmiResult<Vec<ModuleConfig>> {
+        let mut modules: Vec<ModuleConfig> = self.modules().into_iter().cloned().collect();
+        let Some(cat) = self.catchments.get(loc_id) else {
+            return Ok(modules);
+        };
+        for f in cat.formulations.iter().filter(|f| f.name == "bmi_multi") {
+            for over in &f.params.modules {
+                let target = modules
+                    .iter_mut()
+                    .find(|m| m.params.model_type_name == over.params.model_type_name)
+                    .ok_or_else(|| BmiError::FunctionFailed {
+                        model: "config".into(),
+                        func: format!(
+                            "catchments.{}: module '{}' is not in the global formulation",
+                            loc_id, over.params.model_type_name
+                        ),
+                    })?;
+                for (k, v) in &over.params.model_params {
+                    target.params.model_params.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        Ok(modules)
     }
 
     pub fn main_output(&self) -> Option<&str> {
@@ -354,4 +420,78 @@ pub fn parse_datetime(s: &str) -> BmiResult<i64> {
     days += (day - 1) as i64;
 
     Ok(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(json: &str) -> RealizationConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    const BASE: &str = r#"{
+      "global": {"formulations": [{"name": "bmi_multi", "params": {"main_output_variable": "Q_OUT", "modules": [
+        {"name": "bmi_fortran", "params": {"model_type_name": "NoahOWP", "model_params": {"MFSNO": 1.0, "HVT": 5.0}}},
+        {"name": "bmi_c", "params": {"model_type_name": "CFE", "model_params": {"b": 4.0, "satdk": 1e-6}}}
+      ]}}],
+        "forcing": {"path": "./forcings/forcings.nc"}},
+      "time": {"start_time": "2020-01-01 00:00:00", "end_time": "2020-01-02 00:00:00"}
+    }"#;
+
+    fn params(mods: &[ModuleConfig], model: &str) -> HashMap<String, serde_json::Value> {
+        mods.iter().find(|m| m.params.model_type_name == model).unwrap().params.model_params.clone()
+    }
+
+    #[test]
+    fn no_catchments_block_gives_global_modules() {
+        let c = config(BASE);
+        assert!(c.catchments.is_empty());
+        let m = c.modules_for("cat-1").unwrap();
+        assert_eq!(params(&m, "CFE")["b"], 4.0);
+    }
+
+    #[test]
+    fn catchment_overrides_merge_by_model_type_name() {
+        let mut v: serde_json::Value = serde_json::from_str(BASE).unwrap();
+        v["catchments"] = serde_json::json!({
+            "cat-2": {"formulations": [{"name": "bmi_multi", "params": {"modules": [
+                {"name": "bmi_c", "params": {"model_type_name": "CFE", "model_params": {"b": 9.5}}}
+            ]}}], "forcing": {"path": "./forcings/forcings.nc", "provider": "NetCDF"}}
+        });
+        let c: RealizationConfig = serde_json::from_value(v).unwrap();
+        let m2 = c.modules_for("cat-2").unwrap();
+        assert_eq!(params(&m2, "CFE")["b"], 9.5); // overridden
+        assert_eq!(params(&m2, "CFE")["satdk"], 1e-6); // kept from global
+        assert_eq!(params(&m2, "NoahOWP")["HVT"], 5.0); // untouched module
+        let m1 = c.modules_for("cat-1").unwrap();
+        assert_eq!(params(&m1, "CFE")["b"], 4.0); // other locations unchanged
+    }
+
+    #[test]
+    fn unknown_module_in_catchment_is_an_error() {
+        let mut v: serde_json::Value = serde_json::from_str(BASE).unwrap();
+        v["catchments"] = serde_json::json!({
+            "cat-3": {"formulations": [{"name": "bmi_multi", "params": {"modules": [
+                {"name": "bmi_c", "params": {"model_type_name": "TOPMODEL", "model_params": {"x": 1}}}
+            ]}}]}
+        });
+        let c: RealizationConfig = serde_json::from_value(v).unwrap();
+        assert!(c.modules_for("cat-3").is_err());
+    }
+
+    #[test]
+    fn param_values_accepts_numbers_strings_and_arrays() {
+        let p: ModuleParams = serde_json::from_value(serde_json::json!({
+            "model_type_name": "NoahOWP",
+            "model_params": {"a": 1.5, "b": "2.5", "c": [1.0, 2.0, 3.0, 4.0], "d": {"source": "hydrofabric"}}
+        }))
+        .unwrap();
+        let (vals, skipped) = p.param_values();
+        let m: HashMap<_, _> = vals.into_iter().collect();
+        assert_eq!(m["a"], vec![1.5]);
+        assert_eq!(m["b"], vec![2.5]);
+        assert_eq!(m["c"], vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(skipped, vec!["d".to_string()]);
+    }
 }
