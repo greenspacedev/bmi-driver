@@ -193,8 +193,27 @@ impl ModelRunner {
             self.vars.insert(output.clone(), VarSource::Model(idx));
         }
 
-        let input_conversions =
+        let mut input_conversions =
             self.build_unit_conversions(&*model, module, timestep_info.dt_seconds);
+        // `input_scale:<input>` multipliers fold into that input's conversion:
+        // out = (in * scale + offset) * factor. A factor of exactly 1.0 leaves it untouched.
+        for (input, factor) in module.params.input_scales() {
+            if !module.params.variables_names_map.contains_key(&input) {
+                eprintln!(
+                    "warning: {loc_id}: {}.input_scale:{input}: not a mapped input; ignored",
+                    module.params.model_type_name
+                );
+                continue;
+            }
+            if factor == 1.0 {
+                continue;
+            }
+            let conv = input_conversions
+                .entry(input.clone())
+                .or_insert_with(|| crate::units::UnitConversion::identity(""));
+            conv.scale *= factor;
+            conv.offset *= factor;
+        }
 
         self.models.push(ModelInstance {
             name: module.params.model_type_name.clone(),

@@ -200,7 +200,32 @@ fn is_default_upsample(m: &UpsampleMode) -> bool {
     *m == UpsampleMode::Mean
 }
 
+/// `model_params` keys of the form `input_scale:<model input>` multiply that coupled input by the
+/// given factor before it is passed to the model (e.g. a per-catchment PET multiplier:
+/// `"input_scale:water_potential_evaporation_flux": 0.8` on CFE). The driver applies it on top
+/// of the unit conversion; it is never sent to the model's `set_value`.
+pub const INPUT_SCALE_PREFIX: &str = "input_scale:";
+
 impl ModuleParams {
+    /// Input multipliers from `input_scale:<input>` keys, as (model input name, factor).
+    pub fn input_scales(&self) -> Vec<(String, f64)> {
+        let mut out: Vec<(String, f64)> = self
+            .model_params
+            .iter()
+            .filter_map(|(k, v)| {
+                let input = k.strip_prefix(INPUT_SCALE_PREFIX)?;
+                let f = match v {
+                    serde_json::Value::Number(n) => n.as_f64(),
+                    serde_json::Value::String(s) => s.parse().ok(),
+                    _ => None,
+                }?;
+                Some((input.to_string(), f))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     pub fn params_f64(&self) -> HashMap<String, f64> {
         self.model_params
             .iter()
@@ -224,6 +249,9 @@ impl ModuleParams {
         let mut keys: Vec<&String> = self.model_params.keys().collect();
         keys.sort();
         for k in keys {
+            if k.starts_with(INPUT_SCALE_PREFIX) {
+                continue; // applied by the driver to the coupled input, not set on the model
+            }
             let v = &self.model_params[k];
             let parsed = match v {
                 serde_json::Value::Number(n) => n.as_f64().map(|f| vec![f]),
@@ -478,6 +506,24 @@ mod tests {
         });
         let c: RealizationConfig = serde_json::from_value(v).unwrap();
         assert!(c.modules_for("cat-3").is_err());
+    }
+
+    #[test]
+    fn input_scale_keys_are_separate_from_model_params() {
+        let p: ModuleParams = serde_json::from_value(serde_json::json!({
+            "model_type_name": "CFE",
+            "model_params": {"b": 4.0, "input_scale:water_potential_evaporation_flux": 0.8,
+                             "input_scale:x": "1.5"}
+        }))
+        .unwrap();
+        let (vals, skipped) = p.param_values();
+        assert_eq!(vals.len(), 1); // only b is sent to the model
+        assert_eq!(vals[0].0, "b");
+        assert!(skipped.is_empty());
+        assert_eq!(
+            p.input_scales(),
+            vec![("water_potential_evaporation_flux".to_string(), 0.8), ("x".to_string(), 1.5)]
+        );
     }
 
     #[test]
