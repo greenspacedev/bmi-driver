@@ -46,6 +46,8 @@ impl Default for UpsampleMode {
 #[serde(rename_all = "snake_case")]
 pub enum OutputFormat {
     Csv,
+    /// Lossless little-endian f64, one `.f64` + `.json` per location (see `output::f64`).
+    F64,
     Netcdf,
     #[cfg(feature = "zarr")]
     Zarr,

@@ -1,6 +1,7 @@
 use crate::error::BmiResult;
 
 pub mod csv;
+pub mod f64;
 pub mod netcdf;
 #[cfg(feature = "parquet")]
 pub mod parquet;

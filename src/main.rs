@@ -689,6 +689,11 @@ fn create_output_store(
             start_epoch,
             interval,
         ))),
+        OutputFormat::F64 => Ok(Box::new(bmi_driver::output::f64::F64Store::new(
+            output_path.clone(),
+            start_epoch,
+            interval,
+        ))),
         OutputFormat::Netcdf => {
             let first_loc = first_location.unwrap_or("output");
             let nc_path = output_path.join(format!("tmp_{}.nc", first_loc));
